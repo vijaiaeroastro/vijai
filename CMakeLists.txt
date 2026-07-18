@@ -48,6 +48,13 @@ find_package(libgit2 CONFIG REQUIRED)
 # Tree-sitter's runtime and grammars are pinned as official submodules. Keeping
 # them together avoids a partial package-manager setup where only some language
 # grammars are available on a platform.
+#
+# Tree-sitter's public C header does not annotate exports for MSVC, so a shared
+# Windows build produces a DLL without an import library and downstream targets
+# fail with LNK1181. Keep the upstream shared-library default on other systems.
+if(WIN32)
+  set(BUILD_SHARED_LIBS OFF)
+endif()
 add_subdirectory(third_party/tree-sitter EXCLUDE_FROM_ALL)
 
 # The C++ grammar commits its generated parser and scanner sources. Build those
