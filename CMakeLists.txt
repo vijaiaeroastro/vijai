@@ -38,7 +38,7 @@ if(NOT DEFINED CMAKE_TOOLCHAIN_FILE)
       CACHE FILEPATH "Horcrux dependency toolchain")
 endif()
 
-project(Horcrux VERSION 0.1.0 LANGUAGES CXX)
+project(Horcrux VERSION 0.1.0 LANGUAGES C CXX)
 
 find_package(nlohmann_json CONFIG REQUIRED)
 find_package(boost_process CONFIG REQUIRED)
@@ -49,7 +49,19 @@ find_package(libgit2 CONFIG REQUIRED)
 # them together avoids a partial package-manager setup where only some language
 # grammars are available on a platform.
 add_subdirectory(third_party/tree-sitter EXCLUDE_FROM_ALL)
-add_subdirectory(third_party/tree-sitter-cpp EXCLUDE_FROM_ALL)
+
+# The C++ grammar commits its generated parser and scanner sources. Build those
+# directly instead of invoking the optional Tree-sitter CLI at build time.
+add_library(tree-sitter-cpp STATIC
+  third_party/tree-sitter-cpp/src/parser.c
+  third_party/tree-sitter-cpp/src/scanner.c
+)
+target_include_directories(tree-sitter-cpp PRIVATE third_party/tree-sitter-cpp/src)
+set_target_properties(tree-sitter-cpp PROPERTIES
+  C_STANDARD 11
+  C_STANDARD_REQUIRED ON
+  POSITION_INDEPENDENT_CODE ON
+)
 
 option(HORCRUX_BUILD_TESTS "Build Horcrux tests" ON)
 
