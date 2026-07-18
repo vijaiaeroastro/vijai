@@ -7,3 +7,6 @@
 [submodule "external/vcpkg"]
 	path = external/vcpkg
 	url = https://github.com/microsoft/vcpkg.git
+[submodule "third_party/libvterm"]
+	path = third_party/libvterm
+	url = https://github.com/neovim/libvterm.git

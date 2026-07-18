@@ -42,6 +42,7 @@ project(Horcrux VERSION 0.1.0 LANGUAGES C CXX)
 
 find_package(nlohmann_json CONFIG REQUIRED)
 find_package(boost_process CONFIG REQUIRED)
+find_package(clip CONFIG REQUIRED)
 find_package(ftxui CONFIG REQUIRED)
 find_package(libgit2 CONFIG REQUIRED)
 
@@ -70,6 +71,16 @@ set_target_properties(tree-sitter-cpp PROPERTIES
   POSITION_INDEPENDENT_CODE ON
 )
 
+file(GLOB HORCRUX_LIBVTERM_SOURCES CONFIGURE_DEPENDS third_party/libvterm/src/*.c)
+add_library(libvterm STATIC ${HORCRUX_LIBVTERM_SOURCES})
+target_include_directories(libvterm PUBLIC third_party/libvterm/include)
+target_include_directories(libvterm PRIVATE third_party/libvterm/src)
+set_target_properties(libvterm PROPERTIES
+  C_STANDARD 99
+  C_STANDARD_REQUIRED ON
+  POSITION_INDEPENDENT_CODE ON
+)
+
 option(HORCRUX_BUILD_TESTS "Build Horcrux tests" ON)
 
 set(CMAKE_CXX_STANDARD 20)
@@ -90,6 +101,8 @@ add_library(horcrux_core
   src/recovery.cpp
   src/session.cpp
   src/syntax_highlighter.cpp
+  src/system_clipboard.cpp
+  src/terminal_session.cpp
   src/text_buffer.cpp
   src/task_runner.cpp
   src/tooling.cpp
@@ -99,17 +112,27 @@ add_library(horcrux_core
 target_include_directories(horcrux_core PUBLIC include)
 target_include_directories(horcrux_core PRIVATE third_party/tree-sitter-cpp/bindings/c)
 
+if(WIN32)
+  target_compile_definitions(horcrux_core PRIVATE _WIN32_WINNT=0x0A00 WINVER=0x0A00)
+endif()
+
 target_compile_features(horcrux_core PUBLIC cxx_std_20)
 target_link_libraries(horcrux_core PUBLIC
   nlohmann_json::nlohmann_json
   Boost::process
+  clip::clip
   ftxui::screen
   ftxui::dom
   ftxui::component
   libgit2::libgit2package
   tree-sitter
   tree-sitter-cpp
+  libvterm
 )
+
+if(UNIX AND NOT APPLE)
+  target_link_libraries(horcrux_core PRIVATE util)
+endif()
 
 if(MSVC)
   target_compile_options(horcrux_core PRIVATE /W4 /permissive-)
@@ -138,6 +161,7 @@ if(HORCRUX_BUILD_TESTS)
       tests/syntax_highlighter_tests.cpp
       tests/text_buffer_tests.cpp
       tests/task_runner_tests.cpp
+      tests/terminal_session_tests.cpp
       tests/tooling_tests.cpp
     )
     target_link_libraries(horcrux_tests PRIVATE horcrux_core)

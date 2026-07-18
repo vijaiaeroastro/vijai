@@ -5,6 +5,7 @@
   "license": "MIT",
   "dependencies": [
     "boost-process",
+    "dacap-clip",
     "ftxui",
     "libgit2",
     "nlohmann-json"

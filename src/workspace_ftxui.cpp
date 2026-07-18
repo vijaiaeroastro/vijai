@@ -9,23 +9,28 @@
 #include "horcrux/recovery.hpp"
 #include "horcrux/session.hpp"
 #include "horcrux/syntax_highlighter.hpp"
+#include "horcrux/system_clipboard.hpp"
 #include "horcrux/task_runner.hpp"
+#include "horcrux/terminal_session.hpp"
 
 #include <ftxui/component/component.hpp>
 #include <ftxui/component/event.hpp>
 #include <ftxui/component/screen_interactive.hpp>
 #include <ftxui/dom/elements.hpp>
 #include <ftxui/screen/box.hpp>
+#include <ftxui/screen/string.hpp>
 #include <ftxui/screen/terminal.hpp>
 
 #include <algorithm>
 #include <array>
 #include <cctype>
+#include <cstdint>
 #include <chrono>
 #include <cstdio>
 #include <ctime>
 #include <filesystem>
 #include <iomanip>
+#include <iostream>
 #include <memory>
 #include <optional>
 #include <sstream>
@@ -58,6 +63,23 @@ std::string_view theme_name() {
   return "Midnight";
 }
 
+std::string terminal_background_sequence() {
+  switch (active_theme) {
+    case ThemeKind::midnight: return "\x1b]11;#14171b\x07";
+    case ThemeKind::high_contrast: return "\x1b]11;#000000\x07";
+    case ThemeKind::paper: return "\x1b]11;#f8f8f8\x07";
+  }
+  return "";
+}
+
+class TerminalBackgroundScope {
+ public:
+  TerminalBackgroundScope() { apply(); }
+  ~TerminalBackgroundScope() { std::cout << "\x1b]111\x07" << std::flush; }
+
+  static void apply() { std::cout << terminal_background_sequence() << std::flush; }
+};
+
 // FTXUI's colour support is initialized with its terminal app.  These must be
 // functions, not global Color objects, or Color::RGB runs before that setup.
 Color theme_background() {
@@ -74,6 +96,15 @@ Color theme_raised() {
   if (active_theme == ThemeKind::high_contrast) return Color::RGB(48, 48, 48);
   if (active_theme == ThemeKind::paper) return Color::RGB(215, 220, 226);
   return Color::RGB(35, 40, 47);
+}
+Color theme_selection() {
+  if (active_theme == ThemeKind::high_contrast) return Color::RGB(0, 105, 185);
+  if (active_theme == ThemeKind::paper) return Color::RGB(149, 208, 242);
+  return Color::RGB(0, 79, 112);
+}
+Color theme_selection_foreground() {
+  if (active_theme == ThemeKind::paper) return Color::RGB(20, 35, 50);
+  return Color::RGB(255, 255, 255);
 }
 Color theme_foreground() {
   if (active_theme == ThemeKind::high_contrast) return Color::RGB(255, 255, 255);
@@ -205,11 +236,54 @@ std::size_t offset_at(const std::string& text_value, const std::size_t line,
   return std::min(start + column, end);
 }
 
+std::size_t byte_offset_at_display_column(const std::string_view text_value,
+                                          const int display_column) {
+  const int target = std::max(0, display_column);
+  int column = 0;
+  std::size_t byte_offset = 0U;
+  for (const auto& glyph : Utf8ToGlyphs(text_value)) {
+    if (target <= column) return byte_offset;
+    column += std::max(0, string_width(glyph));
+    byte_offset += glyph.size();
+    if (target <= column) return byte_offset;
+  }
+  return text_value.size();
+}
+
 std::string display_name(const Document& document) {
   if (!document.has_path()) return "Untitled";
   const auto filename = document.path().filename().string();
   return filename.empty() ? document.path().string() : filename;
 }
+
+class ShellStartupAnimation {
+ public:
+  static Element render(const std::int64_t ticks) {
+    const auto neon_pink = Color::RGB(255, 55, 190);
+    const auto neon_blue = Color::RGB(82, 196, 255);
+    const auto neon_green = Color::RGB(82, 255, 176);
+    const auto tail = (ticks / 2) % 2 == 0 ? " ~~~" : "  ~~~";
+    auto cat = vbox({
+        hbox({
+            text(" /\\_/\\") | color(neon_pink),
+            text("  .") | color(theme_amber()),
+        }),
+        hbox({
+            text("( o.o )") | color(neon_blue),
+            text(tail) | color(neon_green),
+            text("  Starting Bash") | color(theme_muted()),
+        }),
+        hbox({
+            text(" > ^ <") | color(neon_pink),
+        }),
+    });
+    return vbox({
+        filler(),
+        hbox({filler(), std::move(cat), filler()}),
+        filler(),
+    });
+  }
+};
 
 enum class Focus { tree, editor, tools };
 enum class InteractionMode { edit, navigate };
@@ -217,6 +291,7 @@ enum class Prompt {
   none, find, project_search, open_file, shell_command, commit, save_as, quit_dirty, close_dirty, help
 };
 enum class ToolWindow { find, search, git, tasks, shell };
+enum class ContextAction { copy, cut, paste, select_line };
 
 struct HitTarget {
   ftxui::Box box;
@@ -260,27 +335,32 @@ class Workspace {
     highlighter_.set_path(active().document().path());
     highlighter_.set_source(active().document().buffer().text());
     const auto dimensions = Terminal::Size();
-    const int body_height = std::max(4, dimensions.dimy - 4);
+    // Tabs, status and contextual-key footer consume the other three rows.
+    const int body_height = std::max(4, dimensions.dimy - 3);
     const int editor_width =
         std::max(20, dimensions.dimx - (tree_visible_ && tree_ ? sidebar_width + 1 : 0));
 
-    const int tool_height = output_visible_ ? std::min(12, std::max(5, body_height / 3)) : 0;
+    const int tool_height = output_visible_ ? resolved_tool_height(body_height) : 0;
     const int editor_height = body_height - tool_height;
-    Element body = render_editor(editor_width, editor_height);
-    if (tree_visible_ && tree_) {
-      body = hbox({
-          render_tree(editor_height) | size(WIDTH, EQUAL, sidebar_width),
+    Element editor_column = render_editor(editor_width, editor_height);
+    if (output_visible_) {
+      auto tools = vbox({
           separator() | color(theme_raised()),
-          std::move(body) | flex,
+          render_tool_tabs(),
+          render_output(editor_width, std::max(1, tool_height - 2)) | flex,
+      }) | size(HEIGHT, EQUAL, tool_height);
+      editor_column = vbox({
+          std::move(editor_column) | size(HEIGHT, EQUAL, editor_height),
+          std::move(tools),
       });
     }
 
-    if (output_visible_) {
-      body = vbox({
-          std::move(body) | flex,
+    Element body = std::move(editor_column);
+    if (tree_visible_ && tree_) {
+      body = hbox({
+          render_tree(body_height) | size(WIDTH, EQUAL, sidebar_width),
           separator() | color(theme_raised()),
-          render_tool_tabs(),
-          render_output(dimensions.dimx, std::max(1, tool_height - 2)),
+          std::move(body) | flex,
       });
     }
 
@@ -291,15 +371,29 @@ class Workspace {
         render_keys(),
     });
     if (prompt_ != Prompt::none) {
-      content = dbox({std::move(content), render_modal(dimensions.dimx, dimensions.dimy)});
+      content = dbox({std::move(content) | dim, render_modal(dimensions.dimx, dimensions.dimy)});
     }
     if (theme_picker_visible_) {
       content = dbox({std::move(content), render_theme_picker()});
     }
-    return content | bgcolor(theme_background()) | color(theme_foreground());
+    if (context_menu_visible_) {
+      content = dbox({std::move(content), render_context_menu(dimensions.dimx, dimensions.dimy)});
+    }
+    Elements backdrop_rows;
+    backdrop_rows.reserve(static_cast<std::size_t>(std::max(1, dimensions.dimy)));
+    const std::string backdrop_row(static_cast<std::size_t>(std::max(1, dimensions.dimx)), ' ');
+    for (int row = 0; row < std::max(1, dimensions.dimy); ++row) {
+      backdrop_rows.push_back(text(backdrop_row) | bgcolor(theme_background()));
+    }
+    auto backdrop = vbox(std::move(backdrop_rows));
+    return dbox({std::move(backdrop), std::move(content) | flex}) |
+           size(WIDTH, EQUAL, std::max(1, dimensions.dimx)) |
+           size(HEIGHT, EQUAL, std::max(1, dimensions.dimy)) |
+           color(theme_foreground());
   }
 
   bool event(const Event& event, App& app) {
+    if (context_menu_visible_) return context_menu_event(event);
     if (theme_picker_visible_) return theme_picker_event(event);
     if (prompt_ != Prompt::none) return prompt_event(event, app);
     if (event.is_mouse() && mouse_event(event)) return true;
@@ -319,6 +413,23 @@ class Workspace {
         focus_ = Focus::editor;
         status_ = "EDIT mode";
       }
+      return true;
+    }
+    if (event == Event::AltX) {
+      focus_explorer();
+      return true;
+    }
+    if (event == Event::AltE) {
+      focus_editor();
+      return true;
+    }
+    if (event == Event::AltT) {
+      focus_tools();
+      return true;
+    }
+    if (focus_ == Focus::editor && extend_selection_from_event(event)) return true;
+    if (focus_ == Focus::tools && active_tool_window_ == ToolWindow::shell && output_visible_ &&
+        shell_event(event)) {
       return true;
     }
     if (interaction_mode_ == InteractionMode::navigate && event == Event::i) {
@@ -425,10 +536,7 @@ class Workspace {
       return true;
     }
     if (event == Event::CtrlB) {
-      if (tree_) {
-        tree_visible_ = true;
-        focus_ = focus_ == Focus::tree ? Focus::editor : Focus::tree;
-      }
+      toggle_explorer();
       return true;
     }
     if (event == Event::CtrlN) {
@@ -498,8 +606,7 @@ class Workspace {
       return true;
     }
     if (event == Event::CtrlT) {
-      prompt_text_.clear();
-      prompt_ = Prompt::shell_command;
+      show_shell();
       return true;
     }
     if (event == Event::CtrlL || event == Event::F9) {
@@ -519,12 +626,36 @@ class Workspace {
       prompt_ = Prompt::project_search;
       return true;
     }
-    if (focus_ == Focus::tree && tree_) return tree_event(event);
-    if (interaction_mode_ == InteractionMode::navigate) {
-      if (event == Event::ArrowUp || event == Event::k) scroll_editor(-1);
-      if (event == Event::ArrowDown || event == Event::j) scroll_editor(1);
+    if (focus_ == Focus::editor && event == Event::CtrlC) {
+      copy_current_line(false);
       return true;
     }
+    if (focus_ == Focus::editor && event == Event::CtrlX) {
+      copy_current_line(true);
+      return true;
+    }
+    if (focus_ == Focus::editor && event == Event::CtrlV) {
+      paste_at_cursor();
+      return true;
+    }
+    if (focus_ == Focus::tree && tree_) return tree_event(event);
+    if (interaction_mode_ == InteractionMode::navigate && focus_ == Focus::editor) {
+      if (is_alt_arrow_up(event)) {
+        scroll_editor(-10);
+      } else if (is_alt_arrow_down(event)) {
+        scroll_editor(10);
+      } else if (event == Event::ArrowUp || event == Event::k) {
+        move_editor_cursor_vertical(-1);
+      } else if (event == Event::ArrowDown || event == Event::j) {
+        move_editor_cursor_vertical(1);
+      } else if (event == Event::ArrowLeft) {
+        move_editor_cursor_horizontal(-1);
+      } else if (event == Event::ArrowRight) {
+        move_editor_cursor_horizontal(1);
+      }
+      return true;
+    }
+    if (focus_ == Focus::tools) return true;
     return editor_event(event);
   }
 
@@ -571,8 +702,12 @@ class Workspace {
     const std::string title =
         tree_->root().filename().empty() ? tree_->root().string()
                                         : tree_->root().filename().string();
-    lines.push_back(text(" EXPLORER  " + title) | bold |
-                    color(focus_ == Focus::tree ? theme_teal() : theme_muted()));
+    lines.push_back(hbox({
+        text(" EXPLORER  " + title) | bold |
+            color(focus_ == Focus::tree ? theme_teal() : theme_muted()),
+        filler(),
+        text(" [−] ") | color(theme_muted()) | reflect(explorer_toggle_box_),
+    }));
 
     const auto& entries = tree_->entries();
     const std::size_t selected = tree_->selected_index();
@@ -587,7 +722,7 @@ class Workspace {
       label += entry.relative_path.filename().string();
       auto hit = std::make_unique<HitTarget>();
       hit->index = index;
-      auto line = text(std::move(label)) | reflect(hit->box);
+      auto line = hbox({text(std::move(label)), filler()}) | reflect(hit->box);
       tree_hits_.push_back(std::move(hit));
       if (index == selected) {
         line = line | bgcolor(theme_raised()) |
@@ -611,11 +746,16 @@ class Workspace {
     const auto visible_start = std::min(left_column, value.size());
     const auto visible_end = std::min(value.size(), visible_start + available_width);
     const auto spans = highlighter_.highlight_line(value, source_offset);
+    const auto selection = selected_range();
     const auto kind_at = [&spans](const std::size_t position) {
       const auto found = std::find_if(spans.begin(), spans.end(), [position](const SyntaxSpan& span) {
         return position >= span.start && position < span.start + span.length;
       });
       return found == spans.end() ? SyntaxKind::plain : found->kind;
+    };
+    const auto selected_at = [&selection, source_offset](const std::size_t position) {
+      return selection && source_offset + position >= selection->first &&
+             source_offset + position < selection->second;
     };
 
     Elements elements;
@@ -628,11 +768,18 @@ class Workspace {
         continue;
       }
       const auto kind = kind_at(index);
+      const bool selected = selected_at(index);
       auto end = index + 1U;
-      while (end < visible_end && (!cursor_line || end != cursor_column) && kind_at(end) == kind) {
+      while (end < visible_end && (!cursor_line || end != cursor_column) &&
+             kind_at(end) == kind && selected_at(end) == selected) {
         ++end;
       }
-      elements.push_back(text(value.substr(index, end - index)) | color(syntax_color(kind)));
+      auto span = text(value.substr(index, end - index)) | color(syntax_color(kind));
+      if (selected) {
+        span = std::move(span) | color(theme_selection_foreground()) |
+               bgcolor(theme_selection());
+      }
+      elements.push_back(std::move(span));
       index = end;
     }
     if (cursor_line && cursor_column == value.size() && cursor_column >= visible_start &&
@@ -704,6 +851,9 @@ class Workspace {
     Elements elements{
                text(" " + (status_.empty() ? "ready" : status_)) | flex,
     };
+    const std::string focus_name = focus_ == Focus::tree ? "Explorer" :
+                                   focus_ == Focus::tools ? "Tools" : "Editor";
+    elements.push_back(text(" Focus: " + focus_name + " ") | bold | color(theme_teal()));
     elements.push_back(text(interaction_mode_ == InteractionMode::edit ? " EDIT " : " NAV ") |
                        bold | color(interaction_mode_ == InteractionMode::edit ? theme_teal()
                                                                                   : theme_amber()));
@@ -751,8 +901,45 @@ class Workspace {
       elements.push_back(std::move(tab));
     }
     elements.push_back(filler());
+    const auto resize_colour = tool_height_locked_ ? theme_muted() : theme_teal();
+    auto shrink = text(" [−] ") | color(resize_colour) | reflect(tool_shrink_box_);
+    auto grow = text(" [+] ") | color(resize_colour) | reflect(tool_grow_box_);
+    auto lock = text(tool_height_locked_ ? " 🔒 Lock " : " 🔑 Resize ") |
+                color(tool_height_locked_ ? theme_amber() : theme_teal()) |
+                reflect(tool_lock_box_);
+    elements.push_back(std::move(shrink));
+    elements.push_back(text(std::to_string(tool_height_) + " rows ") | color(theme_muted()));
+    elements.push_back(std::move(grow));
+    elements.push_back(std::move(lock));
     elements.push_back(text(" F9/Esc close ") | color(theme_muted()));
     return hbox(std::move(elements)) | bgcolor(theme_panel()) | size(HEIGHT, EQUAL, 1);
+  }
+
+  int resolved_tool_height(const int body_height) const {
+    // Keep enough room for both the editor and the one-line tool-tab strip.
+    const int maximum = std::max(1, body_height - 2);
+    const int minimum = std::min(5, maximum);
+    return std::clamp(tool_height_, minimum, maximum);
+  }
+
+  void resize_tool_panel(const int delta) {
+    if (tool_height_locked_) {
+      status_ = "Tool height is locked · click 🔒 to resize";
+      return;
+    }
+    const int body_height = std::max(4, Terminal::Size().dimy - 3);
+    tool_height_ = std::max(1, resolved_tool_height(body_height) + delta);
+    status_ = "Tool height: " + std::to_string(tool_height_) + " rows";
+  }
+
+  void toggle_tool_height_lock() {
+    if (tool_height_locked_) {
+      tool_height_locked_ = false;
+      status_ = "Tool height unlocked · use + or − to resize";
+      return;
+    }
+    tool_height_locked_ = true;
+    status_ = "Tools locked at " + std::to_string(tool_height_) + " rows";
   }
 
   Element render_text_output(const std::string& title, const std::string& output,
@@ -798,13 +985,97 @@ class Workspace {
       case ToolWindow::tasks:
         return render_text_output(task_output_title_, task_output_, width, height);
       case ToolWindow::shell:
-        return render_text_output("SHELL · Ctrl+T command",
-                                  shell_output_.empty()
-                                      ? "No commands yet. Ctrl+T runs a command in this project."
-                                      : shell_output_,
-                                  width, height);
+        return render_shell(width, height);
     }
     return text(" ");
+  }
+
+  Element render_terminal_line(TerminalScreenLine line, const int cursor_column,
+                               const bool show_cursor) const {
+    while (show_cursor && line.size() <= static_cast<std::size_t>(cursor_column)) {
+      TerminalCell padding;
+      padding.text = " ";
+      line.push_back(std::move(padding));
+    }
+    Elements cells;
+    for (std::size_t column = 0U; column < line.size(); ++column) {
+      const auto& cell = line[column];
+      if (cell.text.empty()) continue;  // Second half of a wide terminal glyph.
+      auto element = text(cell.text);
+      if (cell.foreground) {
+        element = std::move(element) | color(Color::RGB(cell.foreground->red,
+                                                         cell.foreground->green,
+                                                         cell.foreground->blue));
+      }
+      if (cell.background) {
+        element = std::move(element) | bgcolor(Color::RGB(cell.background->red,
+                                                           cell.background->green,
+                                                           cell.background->blue));
+      }
+      if (cell.bold) element = std::move(element) | bold;
+      if (cell.italic) element = std::move(element) | italic;
+      if (cell.underlined) element = std::move(element) | underlined;
+      if (show_cursor && column == static_cast<std::size_t>(cursor_column)) {
+        element = std::move(element) | color(theme_background()) | bgcolor(theme_teal());
+      }
+      cells.push_back(std::move(element));
+    }
+    return hbox(std::move(cells));
+  }
+
+  Element render_shell(const int width, const int height) {
+    const bool shell_focused = output_visible_ && focus_ == Focus::tools &&
+                               active_tool_window_ == ToolWindow::shell;
+    if (!shell_session_.running() && shell_session_.error().empty()) show_shell();
+    if (shell_session_.running()) {
+      shell_session_.resize(std::max(1, height), std::max(1, width));
+      shell_session_.poll();
+      if (shell_focused) {
+        if (auto* app = App::Active()) app->RequestAnimationFrame();
+      }
+    }
+
+    Elements lines;
+    if (!shell_session_.error().empty()) {
+      lines.push_back(text(" " + shell_session_.error()) | color(Color::RGB(224, 108, 117)));
+    } else {
+      const auto output = shell_session_.screen();
+      const bool has_visible_output = std::any_of(
+          output.begin(), output.end(), [](const TerminalScreenLine& line) {
+            return std::any_of(line.begin(), line.end(), [](const TerminalCell& cell) {
+              return std::any_of(cell.text.begin(), cell.text.end(), [](const char character) {
+                return !std::isspace(static_cast<unsigned char>(character));
+              });
+            });
+          });
+      if (!has_visible_output && shell_session_.running()) {
+        const auto ticks = shell_focused
+                               ? std::chrono::duration_cast<std::chrono::milliseconds>(
+                                     std::chrono::steady_clock::now().time_since_epoch()).count() / 120
+                               : 0;
+        return ShellStartupAnimation::render(ticks) | bgcolor(theme_panel()) |
+               size(WIDTH, EQUAL, std::max(1, width)) |
+               size(HEIGHT, EQUAL, std::max(1, height));
+      }
+      if (has_visible_output) {
+        const auto cursor = shell_session_.cursor();
+        const auto milliseconds = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+        const bool cursor_visible = shell_focused && shell_session_.running() &&
+                                    (milliseconds % 1000) < 600;
+        for (std::size_t row = 0U; row < output.size(); ++row) {
+          if (lines.size() >= static_cast<std::size_t>(height)) break;
+          const bool cursor_here = cursor_visible && cursor &&
+                                   cursor->row == static_cast<int>(row);
+          lines.push_back(render_terminal_line(output[row],
+                                               cursor_here ? cursor->column : 0,
+                                               cursor_here));
+        }
+      }
+    }
+    while (lines.size() < static_cast<std::size_t>(height)) lines.push_back(text(" "));
+    return vbox(std::move(lines)) | bgcolor(theme_panel()) |
+           size(WIDTH, EQUAL, std::max(1, width));
   }
 
   Element render_git_status(const int width, const int height) {
@@ -941,6 +1212,70 @@ class Workspace {
   Element render_keys() {
     // Keep the footer clock fresh even while the editor is otherwise idle.
     if (auto* app = App::Active()) app->RequestAnimationFrame();
+    const bool tool_active = output_visible_ && focus_ == Focus::tools;
+    if (tool_active) {
+      Elements shortcuts;
+      std::string tool_name;
+      std::string tool_state = tool_height_locked_ ? "height locked" : "resizable";
+      switch (active_tool_window_) {
+        case ToolWindow::find:
+          tool_name = "Find";
+          shortcuts = {
+              text(" ↑/↓") | color(theme_teal()), text(" select  "),
+              text("Enter") | color(theme_teal()), text(" open  "),
+              text("Esc") | color(theme_teal()), text(" close  "),
+          };
+          break;
+        case ToolWindow::search:
+          tool_name = "Search";
+          shortcuts = {
+              text(" ↑/↓") | color(theme_teal()), text(" select  "),
+              text("Enter") | color(theme_teal()), text(" open  "),
+              text("Esc") | color(theme_teal()), text(" close  "),
+          };
+          break;
+        case ToolWindow::git:
+          tool_name = "Git";
+          shortcuts = {
+              text(" j/k") | color(theme_teal()), text(" select  "),
+              text("Enter") | color(theme_teal()), text(" stage  "),
+              text("r") | color(theme_teal()), text(" refresh  "),
+              text("c") | color(theme_teal()), text(" commit  "),
+              text("Esc") | color(theme_teal()), text(" close  "),
+          };
+          break;
+        case ToolWindow::tasks:
+          tool_name = "Tasks";
+          shortcuts = {
+              text("F5") | color(theme_teal()), text(" run task  "),
+              text("Esc") | color(theme_teal()), text(" close  "),
+          };
+          break;
+        case ToolWindow::shell:
+          tool_name = "Shell";
+          tool_state = shell_session_.running() ? "running" : "stopped";
+          shortcuts = {
+              text(" ^C") | color(theme_teal()), text(" interrupt  "),
+              text("^D") | color(theme_teal()), text(" exit  "),
+              text("^L") | color(theme_teal()), text(" clear  "),
+              text("^R") | color(theme_teal()), text(" history  "),
+              text("Tab") | color(theme_teal()), text(" complete  "),
+          };
+          break;
+      }
+      auto theme = text(" ◐ " + std::string(theme_name()) + " ") |
+                   color(theme_muted()) | reflect(theme_toggle_box_);
+      shortcuts.push_back(filler());
+      shortcuts.push_back(text(" " + tool_name + " · " + tool_state + " ") |
+                          color(theme_muted()));
+      shortcuts.push_back(text(" Alt-X") | color(theme_teal()));
+      shortcuts.push_back(text(" explorer  "));
+      shortcuts.push_back(text("Alt-E") | color(theme_teal()));
+      shortcuts.push_back(text(" editor  "));
+      shortcuts.push_back(std::move(theme));
+      shortcuts.push_back(text(" " + dual_clock_text() + " ") | color(theme_muted()));
+      return hbox(std::move(shortcuts)) | bgcolor(theme_panel()) | size(HEIGHT, EQUAL, 1);
+    }
     auto tools = hbox({text("^L") | color(theme_teal()), text(" tools  ")}) |
                  reflect(tool_toggle_box_);
     auto theme = text(" ◐ " + std::string(theme_name()) + " ") |
@@ -949,6 +1284,8 @@ class Workspace {
                text(" ^S") | color(theme_teal()), text(" save  "),
                text("^Q") | color(theme_teal()), text(" quit  "),
                text("^B") | color(theme_teal()), text(" explorer  "),
+               text("Alt-E") | color(theme_teal()), text(" editor  "),
+               text("Alt-T") | color(theme_teal()), text(" tools  "),
                text("^F") | color(theme_teal()), text(" find  "),
                text("^G") | color(theme_teal()), text(" search  "),
                text("^O") | color(theme_teal()), text(" open  "),
@@ -971,21 +1308,97 @@ class Workspace {
     for (std::size_t index = 0; index < names.size(); ++index) {
       auto hit = std::make_unique<HitTarget>();
       hit->index = index;
-      auto option = text(std::string(index == theme_selected_ ? "› " : "  ") +
-                         std::string(names[index])) | reflect(hit->box);
+      auto option = hbox({
+          text(std::string(index == theme_selected_ ? "› " : "  ") + std::string(names[index])),
+          filler(),
+      }) | reflect(hit->box) | size(WIDTH, EQUAL, 26);
       theme_option_hits_.push_back(std::move(hit));
       if (index == theme_selected_) option = option | bgcolor(theme_raised()) | color(theme_teal());
       options.push_back(std::move(option));
     }
     options.push_back(separator());
     options.push_back(text(" Enter apply · Esc cancel ") | color(theme_muted()));
-    auto menu = vbox(std::move(options)) | border | bgcolor(theme_panel()) |
-                size(WIDTH, EQUAL, 28);
+    auto menu = clear_under(vbox(std::move(options)) | border | bgcolor(theme_panel()) |
+                            size(WIDTH, EQUAL, 28));
     return vbox({
         filler(),
         hbox({filler(), std::move(menu), filler()}),
         filler(),
     });
+  }
+
+  Element render_context_menu(const int width, const int height) {
+    constexpr std::array<std::pair<ContextAction, std::string_view>, 4> actions{{
+        {ContextAction::copy, " Copy"},
+        {ContextAction::cut, " Cut"},
+        {ContextAction::paste, " Paste"},
+        {ContextAction::select_line, " Select line"},
+    }};
+    context_action_hits_.clear();
+    Elements options;
+    options.push_back(text(" Edit ") | bold | color(theme_teal()));
+    options.push_back(separator());
+    for (std::size_t index = 0U; index < actions.size(); ++index) {
+      auto hit = std::make_unique<HitTarget>();
+      hit->index = index;
+      auto row = hbox({text(std::string(actions[index].second)), filler()}) |
+                 reflect(hit->box) | size(WIDTH, EQUAL, 16);
+      context_action_hits_.push_back(std::move(hit));
+      if (index == context_action_selected_) row = row | bgcolor(theme_raised()) | color(theme_teal());
+      options.push_back(std::move(row));
+    }
+    auto menu = clear_under(vbox(std::move(options)) | border | bgcolor(theme_panel()) |
+                            size(WIDTH, EQUAL, 18));
+    const int left = std::clamp(context_menu_x_, 0, std::max(0, width - 18));
+    const int top = std::clamp(context_menu_y_, 0, std::max(0, height - 7));
+    Elements rows;
+    for (int row = 0; row < top; ++row) rows.push_back(text(" "));
+    rows.push_back(hbox({text(std::string(static_cast<std::size_t>(left), ' ')), std::move(menu), filler()}));
+    rows.push_back(filler());
+    return vbox(std::move(rows));
+  }
+
+  bool context_menu_event(Event event) {
+    if (event == Event::Escape) {
+      context_menu_visible_ = false;
+      return true;
+    }
+    if (event == Event::ArrowUp || event == Event::k) {
+      if (context_action_selected_ > 0U) --context_action_selected_;
+      return true;
+    }
+    if (event == Event::ArrowDown || event == Event::j) {
+      if (context_action_selected_ + 1U < 4U) ++context_action_selected_;
+      return true;
+    }
+    if (event == Event::Return) {
+      run_context_action(context_action_selected_);
+      return true;
+    }
+    if (!event.is_mouse()) return true;
+    const auto& mouse = event.mouse();
+    if (mouse.button != Mouse::Left || mouse.motion != Mouse::Pressed) return true;
+    const auto selected = std::find_if(context_action_hits_.begin(), context_action_hits_.end(),
+                                       [&mouse](const auto& hit) {
+                                         return hit->box.Contain(mouse.x, mouse.y) ||
+                                                hit->box.Contain(mouse.x - 1, mouse.y - 1);
+                                       });
+    if (selected == context_action_hits_.end()) {
+      context_menu_visible_ = false;
+      return true;
+    }
+    run_context_action((*selected)->index);
+    return true;
+  }
+
+  void run_context_action(const std::size_t index) {
+    switch (static_cast<ContextAction>(index)) {
+      case ContextAction::copy: copy_current_line(false); break;
+      case ContextAction::cut: copy_current_line(true); break;
+      case ContextAction::paste: paste_at_cursor(); break;
+      case ContextAction::select_line: select_current_line(); break;
+    }
+    context_menu_visible_ = false;
   }
 
   bool theme_picker_event(Event event) {
@@ -1003,6 +1416,7 @@ class Workspace {
     }
     if (event == Event::Return) {
       active_theme = static_cast<ThemeKind>(theme_selected_);
+      TerminalBackgroundScope::apply();
       theme_picker_visible_ = false;
       status_ = "Theme: " + std::string(theme_name());
       return true;
@@ -1011,17 +1425,21 @@ class Workspace {
       const auto& mouse = event.mouse();
       const int x = mouse.x - 1;
       const int y = mouse.y - 1;
-      const auto contains_mouse = [&mouse, x, y](const Box& box) {
-        return box.Contain(x, y) || box.Contain(mouse.x, mouse.y);
-      };
       if (mouse.button == Mouse::Left && mouse.motion == Mouse::Pressed) {
-        const auto selected = std::find_if(theme_option_hits_.begin(), theme_option_hits_.end(),
-                                           [&contains_mouse](const auto& hit) {
-                                             return contains_mouse(hit->box);
-                                           });
+        auto selected = std::find_if(theme_option_hits_.begin(), theme_option_hits_.end(),
+                                     [&mouse](const auto& hit) {
+                                       return hit->box.Contain(mouse.x, mouse.y);
+                                     });
+        if (selected == theme_option_hits_.end()) {
+          selected = std::find_if(theme_option_hits_.begin(), theme_option_hits_.end(),
+                                  [x, y](const auto& hit) {
+                                    return hit->box.Contain(x, y);
+                                  });
+        }
         if (selected != theme_option_hits_.end()) {
           theme_selected_ = (*selected)->index;
           active_theme = static_cast<ThemeKind>(theme_selected_);
+          TerminalBackgroundScope::apply();
           theme_picker_visible_ = false;
           status_ = "Theme: " + std::string(theme_name());
         }
@@ -1044,7 +1462,7 @@ class Workspace {
              border | bgcolor(theme_raised()) |
              size(WIDTH, LESS_THAN, std::max(20, width - 4)) |
              size(HEIGHT, LESS_THAN, std::max(8, height - 4));
-      return center_window(std::move(window));
+      return center_window(clear_under(std::move(window)));
     }
 
     std::string title;
@@ -1080,7 +1498,7 @@ class Workspace {
     content.push_back(text(hint) | color(theme_muted()));
     auto window = vbox(std::move(content)) | border | bgcolor(theme_raised()) |
                   size(WIDTH, EQUAL, std::min(70, std::max(30, width - 8)));
-    return center_window(std::move(window));
+    return center_window(clear_under(std::move(window)));
   }
 
   bool prompt_event(const Event& event, App& app) {
@@ -1211,6 +1629,26 @@ class Workspace {
       theme_picker_visible_ = true;
       return true;
     }
+    if (mouse.button == Mouse::Left && mouse.motion == Mouse::Pressed && tree_visible_ &&
+        contains_mouse(explorer_toggle_box_)) {
+      toggle_explorer();
+      return true;
+    }
+    if (mouse.button == Mouse::Left && mouse.motion == Mouse::Pressed && output_visible_ &&
+        contains_mouse(tool_shrink_box_)) {
+      resize_tool_panel(-2);
+      return true;
+    }
+    if (mouse.button == Mouse::Left && mouse.motion == Mouse::Pressed && output_visible_ &&
+        contains_mouse(tool_grow_box_)) {
+      resize_tool_panel(2);
+      return true;
+    }
+    if (mouse.button == Mouse::Left && mouse.motion == Mouse::Pressed && output_visible_ &&
+        contains_mouse(tool_lock_box_)) {
+      toggle_tool_height_lock();
+      return true;
+    }
 
     const auto search_result_hit = std::find_if(
         search_result_hits_.begin(), search_result_hits_.end(),
@@ -1274,6 +1712,10 @@ class Workspace {
       }
       for (const auto& hit : tool_tab_hits_) {
         if (contains_mouse(hit->box)) {
+          if (static_cast<ToolWindow>(hit->index) == ToolWindow::shell) {
+            show_shell();
+            return true;
+          }
           active_tool_window_ = static_cast<ToolWindow>(hit->index);
           output_visible_ = true;
           focus_ = Focus::tools;
@@ -1293,6 +1735,35 @@ class Workspace {
       scroll_editor(mouse.button == Mouse::WheelUp ? -3 : 3);
       return true;
     }
+    if (mouse.button == Mouse::Right && mouse.motion == Mouse::Pressed &&
+        contains_mouse(editor_box_)) {
+      if (!selected_range()) {
+        selection_anchor_.reset();
+        place_cursor_from_editor_click(mouse.x, mouse.y);
+      }
+      context_menu_x_ = mouse.x;
+      context_menu_y_ = mouse.y;
+      context_action_selected_ = 0U;
+      context_menu_visible_ = true;
+      return true;
+    }
+    if (mouse_selecting_ && mouse.motion == Mouse::Moved) {
+      if (contains_mouse(editor_box_)) place_cursor_from_editor_click(mouse.x, mouse.y);
+      return true;
+    }
+    if (mouse_selecting_ && mouse.motion == Mouse::Released) {
+      mouse_selecting_ = false;
+      if (selection_anchor_ && *selection_anchor_ == active().cursor()) selection_anchor_.reset();
+      return true;
+    }
+    if (mouse.button == Mouse::Left && mouse.motion == Mouse::Pressed &&
+        contains_mouse(editor_box_)) {
+      selection_anchor_.reset();
+      place_cursor_from_editor_click(mouse.x, mouse.y);
+      selection_anchor_ = active().cursor();
+      mouse_selecting_ = true;
+      return true;
+    }
 
     if (!tree_visible_ || !tree_ || mouse.x > sidebar_width) return false;
 
@@ -1307,10 +1778,18 @@ class Workspace {
       return true;
     }
     if (mouse.button != Mouse::Left || mouse.motion != Mouse::Pressed) return true;
-    const auto tree_hit = std::find_if(tree_hits_.begin(), tree_hits_.end(),
-                                       [&contains_mouse](const auto& hit) {
-                                         return contains_mouse(hit->box);
-                                       });
+    // Tree rows are terminal-aligned. Prefer the raw mouse position here;
+    // trying the shifted position first selects the row immediately above.
+    auto tree_hit = std::find_if(tree_hits_.begin(), tree_hits_.end(),
+                                 [&mouse](const auto& hit) {
+                                   return hit->box.Contain(mouse.x, mouse.y);
+                                 });
+    if (tree_hit == tree_hits_.end()) {
+      tree_hit = std::find_if(tree_hits_.begin(), tree_hits_.end(),
+                              [&x, &y](const auto& hit) {
+                                return hit->box.Contain(x, y);
+                              });
+    }
     if (tree_hit == tree_hits_.end()) return true;
 
     tree_->select((*tree_hit)->index);
@@ -1337,13 +1816,9 @@ class Workspace {
     } else if (event == Event::ArrowRight) {
       if (buffer.cursor() < contents.size()) buffer.set_cursor(buffer.cursor() + 1U);
     } else if (event == Event::ArrowUp) {
-      if (position.line > 0U) {
-        buffer.set_cursor(offset_at(contents, position.line - 1U, buffer.desired_column()));
-      }
+      move_editor_cursor_vertical(-1);
     } else if (event == Event::ArrowDown) {
-      if (position.line + 1U < text_buffer.line_count()) {
-        buffer.set_cursor(offset_at(contents, position.line + 1U, buffer.desired_column()));
-      }
+      move_editor_cursor_vertical(1);
     } else if (event == Event::Home) {
       buffer.set_cursor(position.line_start);
     } else if (event == Event::End) {
@@ -1414,6 +1889,158 @@ class Workspace {
     status_ = "Scrolled";
   }
 
+  static bool is_alt_arrow_up(const Event& event) {
+    return event.input() == "\x1b[1;3A";
+  }
+
+  static bool is_alt_arrow_down(const Event& event) {
+    return event.input() == "\x1b[1;3B";
+  }
+
+  void move_editor_cursor_vertical(const int direction, const bool preserve_selection = false) {
+    auto& buffer = active();
+    const auto& contents = buffer.document().buffer().text();
+    const auto position = position_at(contents, buffer.cursor());
+    const auto line_count = buffer.document().buffer().line_count();
+    if (direction < 0 && position.line > 0U) {
+      buffer.set_cursor(offset_at(contents, position.line - 1U, buffer.desired_column()));
+    } else if (direction > 0 && position.line + 1U < line_count) {
+      buffer.set_cursor(offset_at(contents, position.line + 1U, buffer.desired_column()));
+    }
+    if (!preserve_selection) selection_anchor_.reset();
+    follow_cursor_ = true;
+  }
+
+  void move_editor_cursor_horizontal(const int direction, const bool preserve_selection = false) {
+    auto& buffer = active();
+    const auto& contents = buffer.document().buffer().text();
+    if (direction < 0 && buffer.cursor() > 0U) {
+      buffer.set_cursor(buffer.cursor() - 1U);
+    } else if (direction > 0 && buffer.cursor() < contents.size()) {
+      buffer.set_cursor(buffer.cursor() + 1U);
+    }
+    buffer.set_desired_column(position_at(contents, buffer.cursor()).column);
+    if (!preserve_selection) selection_anchor_.reset();
+    follow_cursor_ = true;
+  }
+
+  [[nodiscard]] std::optional<std::pair<std::size_t, std::size_t>> selected_range() const {
+    if (!selection_anchor_ || *selection_anchor_ == active().cursor()) return std::nullopt;
+    return std::pair{std::min(*selection_anchor_, active().cursor()),
+                     std::max(*selection_anchor_, active().cursor())};
+  }
+
+  bool extend_selection_from_event(const Event& event) {
+    const auto begin = [this] {
+      if (!selection_anchor_) selection_anchor_ = active().cursor();
+    };
+    if (event.input() == "\x1b[1;2A") {
+      begin();
+      move_editor_cursor_vertical(-1, true);
+    } else if (event.input() == "\x1b[1;2B") {
+      begin();
+      move_editor_cursor_vertical(1, true);
+    } else if (event.input() == "\x1b[1;2C") {
+      begin();
+      move_editor_cursor_horizontal(1, true);
+    } else if (event.input() == "\x1b[1;2D") {
+      begin();
+      move_editor_cursor_horizontal(-1, true);
+    } else {
+      return false;
+    }
+    const auto selection = selected_range();
+    status_ = selection ? "Selected " + std::to_string(selection->second - selection->first) + " characters"
+                        : "Selection cleared";
+    return true;
+  }
+
+  void copy_current_line(const bool cut) {
+    auto& buffer = active();
+    auto& text_buffer = buffer.document().buffer();
+    const auto& contents = text_buffer.text();
+    const auto position = position_at(contents, buffer.cursor());
+    const auto selection = selected_range();
+    const auto first = selection ? selection->first : position.line_start;
+    const auto last = selection ? selection->second : position.line_end;
+    const std::string copied = contents.substr(first, last - first);
+    std::string error;
+    if (!clipboard_.copy_text(copied, error)) {
+      status_ = error;
+      return;
+    }
+    if (!cut) {
+      status_ = "Copied";
+      return;
+    }
+    auto erase_end = last;
+    if (!selection && erase_end < contents.size() && contents[erase_end] == '\n') ++erase_end;
+    text_buffer.erase(first, erase_end - first);
+    buffer.set_cursor(first);
+    buffer.set_desired_column(0U);
+    selection_anchor_.reset();
+    changed();
+    status_ = "Cut";
+  }
+
+  void paste_at_cursor() {
+    std::string error;
+    const auto text = clipboard_.paste_text(error);
+    if (!text) {
+      status_ = error;
+      return;
+    }
+    auto& buffer = active();
+    auto& text_buffer = buffer.document().buffer();
+    if (const auto selection = selected_range()) {
+      text_buffer.erase(selection->first, selection->second - selection->first);
+      buffer.set_cursor(selection->first);
+    }
+    text_buffer.insert(buffer.cursor(), *text);
+    buffer.set_cursor(buffer.cursor() + text->size());
+    buffer.set_desired_column(position_at(buffer.document().buffer().text(), buffer.cursor()).column);
+    selection_anchor_.reset();
+    changed();
+    status_ = "Pasted";
+  }
+
+  void select_current_line() {
+    const auto position = position_at(active().document().buffer().text(), active().cursor());
+    selection_anchor_ = position.line_start;
+    active().set_cursor(position.line_end);
+    active().set_desired_column(position.line_end - position.line_start);
+    status_ = "Selected line";
+  }
+
+  void place_cursor_from_editor_click(const int screen_x, const int screen_y) {
+    auto& buffer = active();
+    const auto& contents = buffer.document().buffer().text();
+    const auto row = screen_y - editor_box_.y_min;
+    if (row < 0) return;
+    const auto line = buffer.top_line() + static_cast<std::size_t>(row);
+    const auto line_count = buffer.document().buffer().line_count();
+    if (line >= line_count) return;
+
+    const std::size_t number_width =
+        std::max<std::size_t>(3U, std::to_string(line_count).size());
+    const int source_x = screen_x - editor_box_.x_min -
+                         static_cast<int>(number_width) - 3;
+    const auto start = line_start_at(contents, line);
+    auto end = contents.find('\n', start);
+    if (end == std::string::npos) end = contents.size();
+    if (end > start && contents[end - 1U] == '\r') --end;
+    const auto left = std::min(buffer.left_column(), end - start);
+    const auto visible_source = std::string_view(contents).substr(start + left, end - start - left);
+    const auto column = left + byte_offset_at_display_column(visible_source, source_x);
+
+    buffer.set_cursor(start + column);
+    buffer.set_desired_column(column);
+    focus_ = Focus::editor;
+    interaction_mode_ = InteractionMode::edit;
+    follow_cursor_ = true;
+    status_ = "EDIT · cursor placed";
+  }
+
   void toggle_tool_panel() {
     output_visible_ = !output_visible_;
     output_focus_ = output_visible_ && active_tool_window_ == ToolWindow::search &&
@@ -1423,6 +2050,45 @@ class Workspace {
     git_focus_ = output_visible_ && active_tool_window_ == ToolWindow::git &&
                  !git_status_.entries.empty();
     status_ = output_visible_ ? "Tools shown" : "Tools hidden";
+  }
+
+  void toggle_explorer() {
+    if (!tree_) {
+      status_ = "No workspace explorer";
+      return;
+    }
+    tree_visible_ = !tree_visible_;
+    if (tree_visible_) {
+      focus_ = Focus::tree;
+      status_ = "Explorer shown";
+    } else {
+      if (focus_ == Focus::tree) focus_ = Focus::editor;
+      status_ = "Explorer hidden · Ctrl-B to show";
+    }
+  }
+
+  void focus_explorer() {
+    if (!tree_) {
+      status_ = "No workspace explorer";
+      return;
+    }
+    tree_visible_ = true;
+    focus_ = Focus::tree;
+    interaction_mode_ = InteractionMode::navigate;
+    status_ = "Focus: Explorer";
+  }
+
+  void focus_editor() {
+    focus_ = Focus::editor;
+    interaction_mode_ = InteractionMode::navigate;
+    status_ = "Focus: Editor · i to edit";
+  }
+
+  void focus_tools() {
+    if (!output_visible_) output_visible_ = true;
+    focus_ = Focus::tools;
+    interaction_mode_ = InteractionMode::navigate;
+    status_ = "Focus: Tools";
   }
 
   void cycle_focus() {
@@ -1446,6 +2112,7 @@ class Workspace {
       case ThemeKind::paper: active_theme = ThemeKind::midnight; break;
     }
     status_ = "Theme: " + std::string(theme_name());
+    TerminalBackgroundScope::apply();
   }
 
   void changed() {
@@ -1502,6 +2169,110 @@ class Workspace {
     output_focus_ = false;
     find_focus_ = false;
     status_ = result.launched ? "Shell command finished" : "Shell command failed";
+  }
+
+  void show_shell() {
+    const auto root = project_.workspace_root ? project_.workspace_root : project_.root;
+    active_tool_window_ = ToolWindow::shell;
+    output_visible_ = true;
+    output_focus_ = false;
+    find_focus_ = false;
+    git_focus_ = false;
+    focus_ = Focus::tools;
+    interaction_mode_ = InteractionMode::navigate;
+    if (!root) {
+      status_ = "No project folder for shell";
+      return;
+    }
+    if (!shell_session_.running()) {
+      const auto dimensions = Terminal::Size();
+      std::string error;
+      if (!shell_session_.start(*root, std::max(1, dimensions.dimy / 3),
+                                std::max(1, dimensions.dimx), error)) {
+        status_ = error;
+        return;
+      }
+      status_ = "Bash started in " + root->string();
+    }
+  }
+
+  bool shell_event(const Event& event) {
+    if (!shell_session_.running()) return false;
+    const auto send_control = [this](const char character) {
+      shell_session_.send_text(std::string(1, static_cast<char>(character - 'A' + 1)));
+    };
+    if (event == Event::CtrlA) {
+      send_control('A');
+    } else if (event == Event::CtrlB) {
+      send_control('B');
+    } else if (event == Event::CtrlC) {
+      send_control('C');
+    } else if (event == Event::CtrlD) {
+      send_control('D');
+    } else if (event == Event::CtrlE) {
+      send_control('E');
+    } else if (event == Event::CtrlF) {
+      send_control('F');
+    } else if (event == Event::CtrlG) {
+      send_control('G');
+    } else if (event == Event::CtrlH) {
+      send_control('H');
+    } else if (event == Event::CtrlK) {
+      send_control('K');
+    } else if (event == Event::CtrlL) {
+      send_control('L');
+    } else if (event == Event::CtrlN) {
+      send_control('N');
+    } else if (event == Event::CtrlO) {
+      send_control('O');
+    } else if (event == Event::CtrlP) {
+      send_control('P');
+    } else if (event == Event::CtrlR) {
+      send_control('R');
+    } else if (event == Event::CtrlS) {
+      send_control('S');
+    } else if (event == Event::CtrlT) {
+      send_control('T');
+    } else if (event == Event::CtrlU) {
+      send_control('U');
+    } else if (event == Event::CtrlV) {
+      send_control('V');
+    } else if (event == Event::CtrlW) {
+      send_control('W');
+    } else if (event == Event::CtrlX) {
+      send_control('X');
+    } else if (event == Event::CtrlY) {
+      send_control('Y');
+    } else if (event == Event::CtrlZ) {
+      send_control('Z');
+    } else if (event == Event::Return) {
+      shell_session_.send_text("\r");
+    } else if (event == Event::Backspace) {
+      shell_session_.send_key(TerminalKey::backspace);
+    } else if (event == Event::Tab) {
+      shell_session_.send_text("\t");
+    } else if (event == Event::ArrowUp) {
+      shell_session_.send_key(TerminalKey::up);
+    } else if (event == Event::ArrowDown) {
+      shell_session_.send_key(TerminalKey::down);
+    } else if (event == Event::ArrowLeft) {
+      shell_session_.send_key(TerminalKey::left);
+    } else if (event == Event::ArrowRight) {
+      shell_session_.send_key(TerminalKey::right);
+    } else if (event == Event::Home) {
+      shell_session_.send_key(TerminalKey::home);
+    } else if (event == Event::End) {
+      shell_session_.send_key(TerminalKey::end);
+    } else if (event == Event::PageUp) {
+      shell_session_.send_key(TerminalKey::page_up);
+    } else if (event == Event::PageDown) {
+      shell_session_.send_key(TerminalKey::page_down);
+    } else if (event.is_character()) {
+      shell_session_.send_text(event.character());
+    } else {
+      return false;
+    }
+    return true;
   }
 
   void open_file(const std::filesystem::path& path) {
@@ -1921,6 +2692,8 @@ class Workspace {
   std::vector<std::unique_ptr<EditorBuffer>> buffers_;
   SyntaxHighlighter highlighter_;
   ProjectSearchJob search_job_;
+  SystemClipboard clipboard_;
+  TerminalSession shell_session_;
   std::size_t active_buffer_{0};
   std::optional<FileTree> tree_;
   std::vector<std::unique_ptr<HitTarget>> tree_hits_;
@@ -1930,22 +2703,35 @@ class Workspace {
   std::vector<std::unique_ptr<HitTarget>> search_result_hits_;
   std::vector<std::unique_ptr<HitTarget>> find_result_hits_;
   std::vector<std::unique_ptr<HitTarget>> theme_option_hits_;
+  std::vector<std::unique_ptr<HitTarget>> context_action_hits_;
   Box editor_box_;
+  Box explorer_toggle_box_;
   Box tool_toggle_box_;
   Box theme_toggle_box_;
+  Box tool_shrink_box_;
+  Box tool_grow_box_;
+  Box tool_lock_box_;
   Focus focus_{Focus::editor};
-  InteractionMode interaction_mode_{InteractionMode::edit};
+  InteractionMode interaction_mode_{InteractionMode::navigate};
   Prompt prompt_{Prompt::none};
   std::optional<std::size_t> pending_close_buffer_;
+  std::optional<std::size_t> selection_anchor_;
+  bool mouse_selecting_{false};
   bool tree_visible_{true};
   bool output_visible_{false};
   bool output_focus_{false};
   bool find_focus_{false};
   bool git_focus_{false};
+  bool tool_height_locked_{true};
   bool theme_picker_visible_{false};
+  bool context_menu_visible_{false};
   bool follow_cursor_{true};
   std::size_t editor_visible_lines_{1U};
   std::size_t theme_selected_{0U};
+  std::size_t context_action_selected_{0U};
+  int context_menu_x_{0};
+  int context_menu_y_{0};
+  int tool_height_{12};
   ToolWindow active_tool_window_{ToolWindow::search};
   std::string prompt_text_;
   std::string last_find_;
@@ -1985,7 +2771,9 @@ int run_interactive_workspace(Document& document, ProjectContext& project,
   }
 
   auto app = App::Fullscreen();
+  TerminalBackgroundScope terminal_background;
   app.TrackMouse(true);
+  app.ForceHandleCtrlC(false);
   app.ForceHandleCtrlZ(false);
   auto component = Renderer([&] { return workspace.render(); });
   component = CatchEvent(component, [&](const Event& event) {
