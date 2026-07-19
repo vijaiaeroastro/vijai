@@ -706,6 +706,9 @@ class Workspace {
         text(" EXPLORER  " + title) | bold |
             color(focus_ == Focus::tree ? theme_teal() : theme_muted()),
         filler(),
+        text(tree_->showing_hidden_files() ? " ◉ " : " ◌ ") |
+            color(tree_->showing_hidden_files() ? theme_teal() : theme_muted()) |
+            reflect(hidden_files_toggle_box_),
         text(" [−] ") | color(theme_muted()) | reflect(explorer_toggle_box_),
     }));
 
@@ -1576,6 +1579,14 @@ class Workspace {
   }
 
   bool tree_event(const Event& event) {
+    if (event == Event::Character(".")) {
+      std::string error;
+      tree_->toggle_hidden_files(error);
+      status_ = error.empty()
+                    ? (tree_->showing_hidden_files() ? "Showing hidden files" : "Hiding hidden files")
+                    : error;
+      return true;
+    }
     if (event == Event::ArrowUp || event == Event::k) {
       tree_->select_previous();
       return true;
@@ -1632,6 +1643,15 @@ class Workspace {
     if (mouse.button == Mouse::Left && mouse.motion == Mouse::Pressed && tree_visible_ &&
         contains_mouse(explorer_toggle_box_)) {
       toggle_explorer();
+      return true;
+    }
+    if (mouse.button == Mouse::Left && mouse.motion == Mouse::Pressed && tree_visible_ &&
+        contains_mouse(hidden_files_toggle_box_)) {
+      std::string error;
+      tree_->toggle_hidden_files(error);
+      status_ = error.empty()
+                    ? (tree_->showing_hidden_files() ? "Showing hidden files" : "Hiding hidden files")
+                    : error;
       return true;
     }
     if (mouse.button == Mouse::Left && mouse.motion == Mouse::Pressed && output_visible_ &&
@@ -2706,6 +2726,7 @@ class Workspace {
   std::vector<std::unique_ptr<HitTarget>> context_action_hits_;
   Box editor_box_;
   Box explorer_toggle_box_;
+  Box hidden_files_toggle_box_;
   Box tool_toggle_box_;
   Box theme_toggle_box_;
   Box tool_shrink_box_;

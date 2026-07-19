@@ -66,6 +66,13 @@ bool FileTree::toggle_selected(std::string& error) {
   return refresh(error);
 }
 
+bool FileTree::toggle_hidden_files(std::string& error) {
+  showing_hidden_files_ = !showing_hidden_files_;
+  return refresh(error);
+}
+
+bool FileTree::showing_hidden_files() const noexcept { return showing_hidden_files_; }
+
 bool FileTree::append_directory(const std::filesystem::path& relative_directory,
                                 const std::size_t depth, std::string& error) {
   std::error_code filesystem_error;
@@ -114,6 +121,7 @@ bool FileTree::append_directory(const std::filesystem::path& relative_directory,
 
 bool FileTree::should_ignore(const std::filesystem::path& relative_path) const {
   const auto name = relative_path.filename().string();
+  if (!showing_hidden_files_ && name.starts_with('.')) return true;
   return name == ".git" || name == ".deps" || name == "vcpkg_installed" ||
          name == ".cache" || name == "build" || name.starts_with("build-") ||
          name.starts_with("cmake-build-");

@@ -30,6 +30,8 @@ class FileTree {
   void select_previous() noexcept;
   void select_next() noexcept;
   bool toggle_selected(std::string& error);
+  bool toggle_hidden_files(std::string& error);
+  [[nodiscard]] bool showing_hidden_files() const noexcept;
 
  private:
   bool append_directory(const std::filesystem::path& relative_directory,
@@ -41,6 +43,7 @@ class FileTree {
   std::vector<FileTreeEntry> entries_;
   std::set<std::filesystem::path> expanded_directories_;
   std::size_t selected_index_{0};
+  bool showing_hidden_files_{false};
 };
 
 }  // namespace horcrux

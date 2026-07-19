@@ -15,7 +15,9 @@ void file_tree_tests() {
   std::filesystem::create_directories(root / "src");
   std::filesystem::create_directories(root / "include");
   std::filesystem::create_directories(root / "build");
+  std::filesystem::create_directories(root / ".idea");
   std::ofstream(root / "README.md") << "read me\n";
+  std::ofstream(root / ".env") << "hidden\n";
   std::ofstream(root / "src" / "main.cpp") << "int main() {}\n";
   std::ofstream(root / "build" / "generated.cpp") << "ignored\n";
 
@@ -25,6 +27,14 @@ void file_tree_tests() {
   assert(tree.entries().size() == 3U);
   assert(tree.entries()[0].directory);
   assert(tree.entries()[0].relative_path == "include");
+  assert(!tree.showing_hidden_files());
+  assert(tree.toggle_hidden_files(error));
+  assert(tree.showing_hidden_files());
+  assert(tree.entries().size() == 5U);
+  assert(tree.entries()[0].relative_path == ".idea");
+  assert(tree.entries()[1].relative_path == "include");
+  assert(tree.toggle_hidden_files(error));
+  assert(!tree.showing_hidden_files());
   tree.select_next();
   assert(tree.selected_entry()->relative_path == "src");
   assert(tree.toggle_selected(error));

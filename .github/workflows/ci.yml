@@ -19,9 +19,18 @@ jobs:
           - name: macOS Apple Silicon
             runner: macos-15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           submodules: recursive
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install --yes libxcb1-dev ripgrep
+      - name: Install macOS dependencies
+        if: runner.os == 'macOS'
+        run: brew install ripgrep
+      - name: Install Windows dependencies
+        if: runner.os == 'Windows'
+        run: choco install ripgrep --yes --no-progress
       - name: Configure
         run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug
       - name: Build
