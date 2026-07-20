@@ -174,6 +174,42 @@ endif()
 add_executable(vijai src/main.cpp)
 target_link_libraries(vijai PRIVATE vijai_core)
 
+# Produce self-contained editor bundles from CI. The executable and its own
+# shared library are installed together; platform system libraries remain the
+# responsibility of the supported operating system.
+include(GNUInstallDirs)
+if(APPLE)
+  set_target_properties(vijai PROPERTIES
+    INSTALL_RPATH "@loader_path/../${CMAKE_INSTALL_LIBDIR}"
+  )
+  set_target_properties(vijai_core PROPERTIES
+    INSTALL_RPATH "@loader_path"
+  )
+elseif(UNIX)
+  set_target_properties(vijai PROPERTIES
+    INSTALL_RPATH "$ORIGIN/../${CMAKE_INSTALL_LIBDIR}"
+  )
+  set_target_properties(vijai_core PROPERTIES
+    INSTALL_RPATH "$ORIGIN"
+  )
+endif()
+install(TARGETS vijai vijai_core tree-sitter
+  RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+  LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+  ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
+)
+
+set(CPACK_PACKAGE_NAME "vijai")
+set(CPACK_PACKAGE_VENDOR "Vijai")
+set(CPACK_PACKAGE_VERSION "${PROJECT_VERSION}")
+set(CPACK_PACKAGE_FILE_NAME "vijai-${PROJECT_VERSION}-${CMAKE_SYSTEM_NAME}-${CMAKE_SYSTEM_PROCESSOR}")
+if(WIN32)
+  set(CPACK_GENERATOR "ZIP")
+else()
+  set(CPACK_GENERATOR "TGZ")
+endif()
+include(CPack)
+
 if(VIJAI_BUILD_TESTS)
   include(CTest)
   if(BUILD_TESTING)
